@@ -1,0 +1,60 @@
+version: '3.9'
+
+services:
+  db:
+    image: mssql
+    volumes:
+      - db_data:/var/data
+  # REST Api with debug extras
+  api:
+    image: ${IMAGE_NAME}:debug-${IMAGE_TAG}
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+    build:
+      args:
+        BUILD_CONFIG: Debug
+    configs:
+      - source: appsettings_dev
+        target: /app/appsettings.Development.json
+        mode: 0400
+    secrets:
+      - source: db_password
+        target: /run/secrets/db_password
+        mode: 0400
+  # Tests
+  test:
+    image: ${IMAGE_NAME}-tests:debug-${IMAGE_TAG}
+    build:
+      args:
+        BUILD_CONFIG: Debug
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+    configs:
+      - source: appsettings_dev
+        target: /app/appsettings.Development.json
+        mode: 0400
+      - source: testsettings_dev
+        target: /app/testsettings.Development.json
+        mode: 0400
+    secrets:
+      - source: db_password
+        target: /run/secrets/db_password
+        mode: 0400
+# development settings for local run
+configs:
+  appsettings_dev:
+    file: ./appsettings.Development.json
+  testsettings_dev:
+    file: ./testsettings.Development.json
+volumes:
+  # local data
+  db_data:
+    driver_opts:
+      type: "none"
+      o: bind
+      device: ${DATA_VOLUME_PATH}
+secrets:
+  db_password:
+    environment: DB_PASSWORD
+  nugetconfig:
+    file: ${NUGET_CONFIG_PATH}

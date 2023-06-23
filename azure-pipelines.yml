@@ -1,0 +1,458 @@
+variables: 
+  solution: '**/*.sln'
+  buildPlatform: 'Any CPU'
+  buildConfiguration: 'Release'
+  NUGET_PACKAGES: $(Pipeline.Workspace)/.nuget/packages
+  MK_PATH: $(Pipeline.Workspace)/tools/minikube
+stages:
+  - stage: Build
+    jobs:
+      # Bicep build
+      - job: BuildBicep
+        dependsOn: []
+        displayName: Build Bicep
+        variables: 
+          outputFile: $(Agent.TempDirectory)/$(prIdentifier)/azuredeploy.json
+        steps:
+          - script: |
+              mkdir $(Build.ArtifactStagingDirectory)/$(prIdentifier)
+              mkdir $(Build.ArtifactStagingDirectory)/$(prIdentifier)/bicep
+            displayName: Setup Folders
+          - script: |
+              az bicep build -f bicep/deploy.bicep -o $(outputFile)
+            displayName: Build deploy.bicep
+            workingDirectory: '$(Build.SourcesDirectory)'
+          - task: PublishBuildArtifacts@1
+            inputs:
+              pathToPublish: '$(outputFile)'
+              artifactName: azuredeploy
+      # Bicep Build PR
+      - job: BuildBicepPR
+        dependsOn: []
+        variables: 
+          outputFile: $(Agent.TempDirectory)/$(prIdentifier)/azuredeploy-pr.json
+        displayName: Build Bicep PR
+        steps:
+          - script: |
+              mkdir $(Agent.TempDirectory)/$(prIdentifier)
+              mkdir $(Build.ArtifactStagingDirectory)/$(prIdentifier)
+              mkdir $(Build.ArtifactStagingDirectory)/$(prIdentifier)/bicep-pr
+            displayName: Setup Folders
+          - script: |
+              az bicep build -f bicep/deploy-pr.bicep -o $(outputFile)
+            displayName: Build deploy-pr.bicep
+            workingDirectory: '$(Build.SourcesDirectory)'
+          - task: PublishBuildArtifacts@1
+            inputs:
+              pathToPublish: '$(outputFile)'
+              artifactName: azuredeploy-pr
+      # Helm Build
+      - job: BuildHelm
+        dependsOn: []
+        displayName: Build Helm Chart
+        variables: 
+          CHART_FOLDER: $(Build.SourcesDirectory)/charts/api
+          BASIC_VALUES:  $(Build.SourcesDirectory)/charts/api/values.yaml
+          TEST_VALUES:  $(Build.SourcesDirectory)/charts/api/values.yaml
+        steps:
+          - script: |
+              helm template -f $(BASIC_VALUES) -f $(TEST_VALUES) test $(CHART_FOLDER)
+            displayName: Helm chart template
+          - script: |
+              helm dependency build $(CHART_FOLDER)
+            displayName: Helm lock file
+          - script: |
+              mkdir $(Build.ArtifactStagingDirectory)/$(prIdentifier)
+              mkdir $(Build.ArtifactStagingDirectory)/$(prIdentifier)/helm
+            displayName: Setup Folders
+          - script: |
+              helm package $(CHART_FOLDER) -d $(Build.ArtifactStagingDirectory)/$(prIdentifier)/helm
+            displayName: Helm Package
+          - task: PublishBuildArtifacts@1
+            inputs:
+              pathToPublish: '$(Build.ArtifactStagingDirectory)/$(prIdentifier)/helm'
+              artifactName: chart
+      # Nuget Restore
+      - job: Nuget
+        dependsOn: []
+        displayName: Get Nuget Packages
+        steps:
+          - task: Cache@2
+            displayName: Cache
+            inputs:
+              key: 'nuget | "$(Agent.OS)" | **/packages.lock.json,!**/bin/**,!**/obj/**'
+              restoreKeys: |
+                nuget | "$(Agent.OS)"
+                nuget
+              path: '$(NUGET_PACKAGES)'
+              cacheHitVar: 'CACHE_RESTORED'
+          - task: NuGetCommand@2
+            condition: ne(variables.CACHE_RESTORED, true)
+            inputs:
+              command: 'restore'
+              restoreSolution: '**/*.sln'
+      # Dotnet Build and Test
+      - job: DotnetBuild
+        dependsOn: 
+          - Nuget
+        displayName: Dotnet Test
+        steps:
+          - task: UseDotNet@2
+            displayName: 'Install .NET Core SDK'
+            inputs:
+              version: 7.x
+              performMultiLevelLookup: true
+              includePreviewVersions: true 
+          - task: DotNetCoreCLI@2
+            inputs:
+              command: 'build'
+              arguments: '--no-restore --configuration $(buildConfiguration)'
+            displayName: 'dotnet build $(buildConfiguration)'
+          - task: DotNetCoreCLI@2
+            inputs:
+              command: test
+              projects: $(solution)
+              arguments: >-
+                --no-build
+                --configuration 
+                $(buildConfiguration)
+                --filter
+                "TestCategory=L1"
+                --collect:"XPlat Code Coverage" 
+                -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Format=cobertura
+              publishTestResults: true
+          - task: PublishCodeCoverageResults@1
+            displayName: 'Publish code coverage report'
+            inputs:
+              codeCoverageTool: 'Cobertura'
+              summaryFileLocation: '$(Agent.TempDirectory)/**/coverage.cobertura.xml'
+
+      # Api Container Image build
+      - job: ApiDockerBuild
+        displayName: Api Docker Build
+        dependsOn: 
+          - Nuget
+        variables: 
+          outputImage: $(Build.ArtifactStagingDirectory)/$(prIdentifier)/docker/api.image.tar.gz
+        steps:
+          - script: |
+              docker buildx \
+                $(Build.SourcesDirectory) \
+                -t $(imageName):$(prIdentifier) \
+                -f $(Build.SourcesDirectory)/src/Api/Dockerfile \
+                --build-arg BUILD_CONFIG=$(buildConfiguration) \
+                --cache-from=type=local,src=$(NUGET_PACKAGES),name=nuget \
+                --secret=id=nugetconfig,src=$(NUGET_CONFIG_PATH)
+            env:
+              IMAGE_NAME: $(imageName)
+              IMAGE_TAG: $(prIdentifier)
+              BUILD_CONFIG: $(buildConfiguration)
+              NUGET_CONFIG_PATH: $(NUGET_CONFIG_PATH)
+          - script: |
+              mkdir $(Build.ArtifactStagingDirectory)/$(prIdentifier)
+              mkdir $(Build.ArtifactStagingDirectory)/$(prIdentifier)/docker
+            displayName: Setup Folders
+          - script: |
+              docker save ${IMAGE_NAME}:${IMAGE_TAG} | gzip > $outputImage
+            env:
+              IMAGE_NAME: $(imageName)
+              IMAGE_TAG: $(prIdentifier)
+          - task: PublishBuildArtifacts@1
+            inputs:
+              pathToPublish: '$(outputImage)'
+              artifactName: api-image
+      # Api with extra Container Image build
+      - job: ApiRandomPropertyDockerBuild
+        displayName: Api Docker Build with extra property
+        dependsOn: 
+          - Nuget
+        variables: 
+          outputImage: $(Build.ArtifactStagingDirectory)/$(prIdentifier)/docker/api-extra.image.tar.gz
+        steps:
+          - script: |
+              docker buildx \
+                $(Pipeline.Workspace)/src \
+                -t ${IMAGE_NAME}:${IMAGE_TAG} \
+                -f $(Pipeline.Workspace)/src/src/Api/Dockerfile \
+                --build-arg BUILD_CONFIG=$(buildConfiguration) \
+                --build-arg RANDOM_PROPERTY=true \
+                --cache-from=type=local,src=$(NUGET_PACKAGES),name=nuget \
+                --secret=id=nugetconfig,src=$(NUGET_CONFIG_PATH)
+            env:
+              IMAGE_NAME: $(imageName)-random-prop
+              IMAGE_TAG: $(prIdentifier)
+              BUILD_CONFIG: $(buildConfiguration)
+              NUGET_CONFIG_PATH: $(NUGET_CONFIG_PATH)
+          - script: |
+              mkdir $(Agent.TempDirectory)/$(prIdentifier)
+              mkdir $(Build.ArtifactStagingDirectory)/$(prIdentifier)
+              mkdir $(Build.ArtifactStagingDirectory)/$(prIdentifier)/docker
+            displayName: Setup Folders
+          - script: |
+              docker save ${IMAGE_NAME}:${IMAGE_TAG} | gzip > $outputImage
+            env:
+              IMAGE_NAME: $(imageName)
+              IMAGE_TAG: $(prIdentifier)
+          - task: PublishBuildArtifacts@1
+            inputs:
+              pathToPublish: '$(outputImage)'
+              artifactName: api-extra-image
+      # Test Container Image build
+      - job: TestDockerBuild
+        displayName: Test Docker Build
+        dependsOn: 
+          - Nuget
+        variables:
+          outputImage: $(Build.ArtifactStagingDirectory)/$(prIdentifier)/docker/test.image.tar.gz
+        steps:
+          - script: |
+              docker buildx \
+                $(Pipeline.Workspace)/src \
+                -t ${IMAGE_NAME}:${IMAGE_TAG} \
+                -f $(Pipeline.Workspace)/src/test/Api.Test/Dockerfile \
+                --build-arg BUILD_CONFIG=$(buildConfiguration) \
+                --cache-from=type=local,src=$(NUGET_PACKAGES),name=nuget \
+                --secret=id=nugetconfig,src=$(NUGET_CONFIG_PATH)
+            env:
+              IMAGE_NAME: $(imageName)-test
+              IMAGE_TAG: $(prIdentifier)
+              BUILD_CONFIG: $(buildConfiguration)
+              NUGET_CONFIG_PATH: $(NUGET_CONFIG_PATH)
+          - script: |
+              mkdir $(Agent.TempDirectory)/$(prIdentifier)
+              mkdir $(Build.ArtifactStagingDirectory)/$(prIdentifier)
+              mkdir $(Build.ArtifactStagingDirectory)/$(prIdentifier)/docker
+            displayName: Setup Folders
+          - script: |
+              docker save ${IMAGE_NAME}:${IMAGE_TAG} | gzip > $outputImage
+            env:
+              IMAGE_NAME: $(imageName)
+              IMAGE_TAG: $(prIdentifier)
+          - task: PublishBuildArtifacts@1
+            inputs:
+              pathToPublish: '$(outputImage)'
+              artifactName: test-image
+  - stage: Deployment
+    condition: succeed(Build)
+    variables: 
+      outputFile: $(Pipeline.Workspace)/values.bicep.yaml
+    jobs:
+      - job: BicepPRDeployment
+        variables: 
+          rgName: pr-rg-$prIdentifier
+        displayName: Bicep Deployment PR
+        steps:
+          - script: |
+              az group create $(rgName)
+            displayName: Create Resource Group
+          - script: |
+              az deployment group create $(deployName) -g $(rgName)
+            displayName: Create Deployment Group
+          - script: |
+              az deployment group show -g $(rgName) -n $(deployName) --query properties.outputs.helmValues > $(outputFile)
+            displayName: Output Deployment Group values
+          - script: |
+              az 
+          - task: PublishBuildArtifacts@1
+            inputs:
+              pathToPublish: '$(outputFile)'
+              artifactName: helm-bicep
+  - stage: TestDeployment
+    condition: succeed(Deployment)
+  - stage: IntegrationTests
+    displayName: Integration Tests
+    dependsOn:
+      - Deployment
+    jobs:
+      - job: MinikubeInstall
+        steps:
+          - script: |
+              echo "##vso[task.setvariable variable=MK_VERSION;]$(curl -sL https://api.github.com/repos/vmware/govmomi/releases/latest | jq -r '.tag_name')"
+          - task: Cache@2
+            displayName: Cache
+            inputs:
+              key: 'mk | "$(Agent.OS)" | "$(MK_VERSION)"'
+              restoreKeys: |
+                mk | "$(Agent.OS)" | "$(MK_VERSION)"
+              path: '$(MK_PATH)'
+              cacheHitVar: 'MK_CACHE_RESTORED'
+      - job: Minikube-PR
+        dependsOn: 
+          - MinikubeInstall
+        steps:
+          - task: DownloadBuildArtifacts@0
+            inputs:
+              buildType: 'current'
+              downloadType: 'single'
+              artifactName: 'chart'
+              downloadPath: '$(System.ArtifactsDirectory)/chart'
+            displayName: Download Chart
+          - task: DownloadBuildArtifacts@0
+            inputs:
+              buildType: 'current'
+              downloadType: 'single'
+              artifactName: 'helm-bicep'
+              downloadPath: '$(System.ArtifactsDirectory)'
+            displayName: Download Helm Bicep values
+          - task: DownloadBuildArtifacts@0
+            inputs:
+              buildType: 'current'
+              downloadType: 'single'
+              artifactName: 'api-image'
+              downloadPath: '$(System.ArtifactsDirectory)'
+            displayName: Download Api Image
+          - task: DownloadBuildArtifacts@0
+            inputs:
+              buildType: 'current'
+              downloadType: 'single'
+              artifactName: 'api-extra-image'
+              downloadPath: '$(System.ArtifactsDirectory)'
+            displayName: Download Api Extra Image
+          - task: DownloadBuildArtifacts@0
+            inputs:
+              buildType: 'current'
+              downloadType: 'single'
+              artifactName: 'test-image'
+              downloadPath: '$(System.ArtifactsDirectory)'
+            displayName: Download Test Image
+          - script: |
+              whoami
+              echo $(date)
+              docker version
+              docker info
+              docker system info
+              curl -LO https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64
+              sudo install minikube-linux-amd64 /usr/local/bin/minikube
+            displayName: Download Minikube
+            condition: ne(variables.MK_CACHE_RESTORED, true)
+          - script: |
+              minikube version
+              minikube start --force
+              minikube kubectl -- get pods -A
+            displayName: MK (System.ArtifactsDirectory
+          - script: |
+              eval $(minikube docker-env)
+              docker load $(System.ArtifactsDirectory)/docker/api.image.tar.gz $(imageName):$(imageTag)
+              docker load $(System.ArtifactsDirectory)/docker/api-extra.image.tar.gz $(extraImageName):$(imageTag)
+              docker load $(System.ArtifactsDirectory)/docker/test.image.tar.gz $(testImageName):$(imageTag)
+            name: PrMkDockerImport
+            displayName: Import Docker images
+          - script: |
+              cat <<EOF > $(System.ArtifactsDirectory)/values.test.yaml
+              api:
+                image: $(extraImageName)
+                tag: $(imageTag)
+              test:
+                image: $(testImageName)
+                tag: $(imageTag)
+              EOF
+            displayName: Create test image override file
+          - script: |
+              cat <<EOF > $(System.ArtifactsDirectory)/values.actual.yaml
+              api:
+                image: $(imageName)
+                tag: $(imageTag)
+              test:
+                image: $(testImageName)
+                tag: $(imageTag)
+              EOF
+            displayName: Create actual image override file
+          - script: |
+              helm upgrade pr-test \
+                $(System.ArtifactsDirectory)/chart \
+                --install \
+                -n $(prIdentifier) \
+                --create-namespace \
+                -f $(System.ArtifactsDirectory)/chart/values.yaml \
+                -f $(System.ArtifactsDirectory)/values.bicep.yaml \
+                -f $(System.ArtifactsDirectory)/values.actual.yaml \
+                --timeout 25m0s \
+                --debug
+          - script: |
+              helm upgrade pr-test \
+                $(System.ArtifactsDirectory)/chart \
+                -n $(prIdentifier) \
+                --create-namespace \
+                -f $(System.ArtifactsDirectory)/chart/values.yaml \
+                -f $(System.ArtifactsDirectory)/values.bicep.yaml \
+                -f $(System.ArtifactsDirectory)/values.test.yaml \
+                --timeout 25m0s \
+                --debug
+            name: PRHelmUpgrade
+            displayName: Helm Upgrade
+          - script: |
+              helm test pr-test -n $(prIdentifier) --timeout 25m0s --debug
+            displayName: Helm Test
+          - script: |
+              helm uninstall pr-test -n $(prIdentifier) --timeout 25m0s --debug
+            condition: always(PRHelmInstall)
+            displayName: Cleanup MK pr install
+          - script: |
+              kubectl delete ns $(prIdentifier)
+            condition: always(PRHelmInstall)
+            displayName: Cleanup MK pr namespace
+          - script: |
+              eval $(minikube docker-env)
+              docker rmi $(imageName):$(imageTag)
+              docker rmi $(extraImageName):$(imageTag)
+              docker rmi $(testImageName):$(imageTag)
+            condition: always(PrMkDockerImport)
+            displayName: Cleanup MK Docker import
+
+  - stage: Publish
+    jobs:
+      - job: ApiDockerPublish
+        displayName: Publish Docker
+        steps:
+          - task: DownloadBuildArtifacts@0
+            inputs:
+              buildType: 'current'
+              downloadType: 'single'
+              artifactName: 'api-image'
+              downloadPath: '$(System.ArtifactsDirectory)'
+          - script: ""
+            displayName: Publish Api Image
+      - job: ApiExtraDockerPublish
+        displayName: Publish Docker
+        steps:
+          - task: DownloadBuildArtifacts@0
+            inputs:
+              buildType: 'current'
+              downloadType: 'single'
+              artifactName: 'api-extra-image'
+              downloadPath: '$(System.ArtifactsDirectory)'
+          - script: ""
+            displayName: ""
+      - job: HelmPublish
+        displayName: Publish Helm Chart
+        steps:
+          - task: DownloadBuildArtifacts@0
+            inputs:
+              buildType: 'current'
+              downloadType: 'single'
+              artifactName: 'chart'
+              downloadPath: '$(System.ArtifactsDirectory)'
+          - script: ""
+            displayName: Publish Helm Chart
+      - job: DeploymentTemplatePublish
+        displayName: Publish Azure Deployment Template
+        steps:
+          - task: DownloadBuildArtifacts@0
+            inputs:
+              buildType: 'current'
+              downloadType: 'single'
+              artifactName: 'azuredeploy'
+              downloadPath: '$(System.ArtifactsDirectory)'
+          - script: ""
+            displayName: Publish Deployment Template
+  - stage: Cleanup
+    condition: always()
+    jobs:
+      - job: CleanupArtifacts
+        displayName: Cleanup Artifacts
+        steps:
+          - script: |
+              del /s /q *.* 2>NUL
+              rmdir /s /q "./" 2>NUL
+              exit 0
+            displayName: Cleanup artifacts

@@ -1,0 +1,1 @@
+docker compose -f docker-compose.yml docker-compose.extra-property.yml build

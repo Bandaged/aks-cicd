@@ -1,0 +1,17 @@
+version: '3.9'
+
+services:
+  # REST Api Image with extra property
+  api-random-property:
+    image: ${EXTRA_IMAGE_NAME}:${IMAGE_TAG}
+    build:
+      context: ./
+      dockerfile: ./api.dockerfile
+      args:
+        RANDOM_PROPERTY: "true"
+      cache_from:
+        - type=local,src=${NUGET_CACHE_PATH},name=nuget
+      secrets:
+        - target: /run/secrets/nuget.config
+          source: nugetconfig
+          mode: 0444

@@ -1,0 +1,16 @@
+version: '3.9'
+
+services:
+  test:
+    image: ${IMAGE_NAME}-tests:${IMAGE_TAG}
+    build:
+      context: ./
+      dockerfile: ./test.dockerfile
+      args:
+        RANDOM_PROPERTY: "true"
+      cache_from:
+        - type=local,src=${NUGET_CACHE_PATH},name=nuget
+      secrets:
+        - target: /run/secrets/nuget.config
+          source: nugetconfig
+          mode: 0444
